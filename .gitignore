@@ -1,0 +1,6 @@
+.soteria/
+report.json
+report.md
+
+.zig-cache/
+zig-out

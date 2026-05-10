@@ -15,7 +15,11 @@ pub fn scanFiles(
     var results = std.ArrayList(types.FileMetrics).empty;
     errdefer results.deinit(a);
 
-    const dir = try std.Io.Dir.openDirAbsolute(io, repo_path, .{ .iterate = true });
+    const dir = if (std.fs.path.isAbsolute(repo_path)) d: {
+        break :d try std.Io.Dir.openDirAbsolute(io, repo_path, .{ .iterate = true });
+    } else d: {
+        break :d try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, repo_path, .{ .iterate = true });
+    };
     defer std.Io.Dir.close(dir, io);
 
     var walker = try dir.walk(a);
