@@ -61,6 +61,137 @@ pub fn parseNumstatLine(line: []const u8, a: std.mem.Allocator) !?FileEntry {
     };
 }
 
+/// Per-commit file set entry for coupling analysis.
+pub const CommitFiles = struct {
+    hash: []const u8,
+    files: []const []const u8,
+};
+
+/// Run `git log --name-only` to extract per-commit file sets for coupling.
+/// This is a separate pass from `runGitLog` because coupling needs commit→set
+/// structure rather than file→time-series structure.
+///
+/// Git command:
+///   git -C <repo_path> log --name-only --format="COMMIT%n%H" --after="<after>" --no-renames
+pub fn runGitLogNameOnly(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repo_path: []const u8,
+    after: []const u8,
+    verbose: bool,
+) !std.ArrayList(CommitFiles) {
+    if (verbose) {
+        std.debug.print("  running git log --name-only --after=\"{s}\" in {s}\n", .{ after, repo_path });
+    }
+
+    const after_arg = try std.fmt.allocPrint(a, "--after={s}", .{after});
+    const argv = &[_][]const u8{
+        "git",
+        "-C",
+        repo_path,
+        "log",
+        "--name-only",
+        "--format=COMMIT%n%H",
+        after_arg,
+        "--no-renames",
+    };
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+
+    var stdout_output = std.ArrayList(u8).empty;
+    defer stdout_output.deinit(a);
+    if (child.stdout) |child_stdout| {
+        var read_buf: [8192]u8 = undefined;
+        var reader = child_stdout.reader(io, &read_buf);
+        try reader.interface.appendRemaining(a, &stdout_output, std.Io.Limit.limited(1024 * 1024 * 10));
+    }
+
+    var stderr_output = std.ArrayList(u8).empty;
+    defer stderr_output.deinit(a);
+    if (child.stderr) |child_stderr| {
+        var read_buf: [4096]u8 = undefined;
+        var reader = child_stderr.reader(io, &read_buf);
+        reader.interface.appendRemaining(a, &stderr_output, std.Io.Limit.limited(4096)) catch {};
+    }
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                if (verbose) {
+                    std.debug.print("  git log --name-only exited with code {d}\n", .{code});
+                    std.debug.print("  stderr: {s}\n", .{stderr_output.items});
+                }
+                return error.GitLogFailed;
+            }
+        },
+        else => return error.GitLogFailed,
+    }
+
+    return parseGitNameOnlyOutput(a, stdout_output.items, verbose);
+}
+
+/// Parse git log --name-only output into a list of CommitFiles.
+fn parseGitNameOnlyOutput(
+    a: std.mem.Allocator,
+    output: []const u8,
+    verbose: bool,
+) !std.ArrayList(CommitFiles) {
+    var results = std.ArrayList(CommitFiles).empty;
+    errdefer results.deinit(a);
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var current_hash: ?[]const u8 = null;
+    var current_files = std.ArrayList([]const u8).empty;
+    defer current_files.deinit(a);
+    var total_commits: usize = 0;
+
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "COMMIT")) {
+            // Save previous commit's data
+            if (current_hash) |hash| {
+                const files = try current_files.toOwnedSlice(a);
+                try results.append(a, .{ .hash = hash, .files = files });
+                current_files = std.ArrayList([]const u8).empty;
+                total_commits += 1;
+            }
+            current_hash = null;
+            continue;
+        }
+
+        if (current_hash == null) {
+            if (line.len == 40) {
+                current_hash = try a.dupe(u8, line);
+            }
+            continue;
+        }
+
+        // Skip empty lines
+        if (line.len == 0) continue;
+
+        // This is a file path
+        const path_owned = try a.dupe(u8, line);
+        try current_files.append(a, path_owned);
+    }
+
+    // Save last commit
+    if (current_hash) |hash| {
+        const files = try current_files.toOwnedSlice(a);
+        try results.append(a, .{ .hash = hash, .files = files });
+        total_commits += 1;
+    }
+
+    if (verbose) {
+        std.debug.print("  parsed {d} commits for coupling\n", .{total_commits});
+    }
+
+    return results;
+}
+
 /// Run `git log` in the given repo path and aggregate per-file time series.
 ///
 /// Git command:

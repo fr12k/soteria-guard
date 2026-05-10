@@ -134,6 +134,28 @@ pub fn writeJsonReport(
     try w.writeAll("  \"exit_code\": 0\n}\n");
 }
 
+/// Write the coupling matrix as a standalone JSON file.
+pub fn writeCouplingJson(
+    w: anytype,
+    pairs: []const types.CouplingPair,
+) !void {
+    try w.writeAll("[\n");
+    for (pairs, 0..) |p, i| {
+        const comma = if (i < pairs.len - 1) "," else "";
+        try w.print("  {{\"file_a\":\"{s}\",\"file_b\":\"{s}\",\"shared_commits\":{d},\"total_commits_a\":{d},\"total_commits_b\":{d},\"degree\":{d:.4},\"trend\":{d}}}{s}\n", .{
+            p.file_a,
+            p.file_b,
+            p.shared_commits,
+            p.total_commits_a,
+            p.total_commits_b,
+            p.degree,
+            @as(u8, @intFromEnum(p.trend)),
+            comma,
+        });
+    }
+    try w.writeAll("]\n");
+}
+
 /// Write a Markdown report to the given writer.
 pub fn writeMarkdownReport(
     w: anytype,
@@ -217,6 +239,30 @@ pub fn writeMarkdownReport(
             });
         }
         try w.writeAll("\n");
+
+        // Expandable reference explaining temporal coupling
+        try w.writeAll("<details>\n");
+        try w.writeAll("<summary>📖 What is Temporal Coupling?</summary>\n\n");
+        try w.writeAll("**Temporal coupling** (also called *change coupling*) measures how often two files are modified together in the same commit. It detects logical dependencies without needing a language-specific parser.\n\n");
+        try w.writeAll("### How to Read the Degree\n\n");
+        try w.writeAll("The degree answers: *\"If I change file A, what's the chance I also need to change file B?\"*\n\n");
+        try w.writeAll("| Range | Meaning |\n");
+        try w.writeAll("|-------|---------|\n");
+        try w.writeAll("| 0–15% | Noise — filtered out |\n");
+        try w.writeAll("| 15–40% | Occasional co-change; may be legitimate API boundaries |\n");
+        try w.writeAll("| 40–70% | Suspicious — likely a missing abstraction or copy-paste |\n");
+        try w.writeAll("| 70%+ | Almost always co-changed — files are logically welded together |\n\n");
+        try w.writeAll("### The Trend Arrow\n\n");
+        try w.writeAll("- **🔺 Rising** — coupling is getting stronger. The architectural boundary is eroding.\n");
+        try w.writeAll("- **🔽 Falling** — coupling is weakening. Files are becoming more independent.\n");
+        try w.writeAll("- **➡️ Stable** — coupling is consistent over time.\n\n");
+        try w.writeAll("Rising trends are the most actionable signal. They indicate that refactoring should be scheduled before the entanglement gets worse.\n\n");
+        try w.writeAll("### Cross-Package Coupling\n\n");
+        try w.writeAll("The most interesting pairs are those in **different packages/directories**. These suggest:\n\n");
+        try w.writeAll("- A missing abstraction that should be extracted into a shared module\n");
+        try w.writeAll("- A copy-paste relationship between unrelated parts of the codebase\n");
+        try w.writeAll("- An architectural dependency that violates the intended layering\n\n");
+        try w.writeAll("</details>\n\n");
     }
 
     try w.writeAll("---\n\n");

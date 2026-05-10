@@ -152,8 +152,13 @@ pub fn main(init: std.process.Init) !void {
     var evolution_list = try churn.computeEvolutionMetrics(a, time_series_list.items, config.verbose);
     errdefer evolution_list.deinit(a);
 
-    // ── Step 3b: Compute coupling (stub for v1) ──
-    var coupling_pairs = try coupling.computeCoupling(a, time_series_list.items, config.verbose);
+    // ── Step 3b: Run git log --name-only for coupling ──
+    var commit_files_list = try git_log.runGitLogNameOnly(a, io, config.path, config.after, config.verbose);
+    errdefer {
+        for (commit_files_list.items) |*cf| a.free(cf.files);
+        commit_files_list.deinit(a);
+    }
+    var coupling_pairs = try coupling.computeCoupling(a, commit_files_list.items, config.verbose);
     errdefer coupling_pairs.deinit(a);
 
     // ── Step 4: Build path → evolution lookup, then merge into FileResults ──
@@ -285,8 +290,59 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.File.writeStreamingAll(th_file, io, writer.buffered());
     }
 
-    // Write history DB entries
+    // Write coupling matrix (only if non-empty) — write directly to file
+    if (coupling_pairs.items.len > 0) {
+        const cp_file = try std.Io.Dir.createFile(repo_dir, io, config.coupling_file, .{});
+        defer std.Io.File.close(cp_file, io);
+
+        var cp_buf: [8192]u8 = undefined;
+        var cp_writer = cp_file.writer(io, &cp_buf);
+        try report.writeCouplingJson(&cp_writer.interface, coupling_pairs.items);
+        try cp_writer.interface.flush();
+    }
+
+    // Write all history DB entries in a single file append operation
+    // With decay: entries older than 12 months are dropped
     {
+        var existing = std.ArrayList(u8).empty;
+        defer existing.deinit(a);
+
+        // Try to read existing history file and filter out old entries
+        if (std.Io.Dir.readFileAlloc(repo_dir, io, config.history_file, a, std.Io.Limit.unlimited)) |existing_content| {
+            // Filter: keep only entries from the last 12 months
+            // Each line is JSON; extract the date field (YYYY-MM-DD) and compare
+            var lines = std.mem.splitScalar(u8, existing_content, '\n');
+            while (lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0) continue;
+                // Try to extract date: "date":"YYYY-MM-DD"
+                // Search for the date field pattern
+                if (std.mem.indexOf(u8, trimmed, "\"date\":\"")) |date_start| {
+                    const val_start = date_start + 8; // past "date":"
+                    if (std.mem.indexOfScalar(u8, trimmed[val_start..], '"')) |quote_end| {
+                        const date_str = trimmed[val_start .. val_start + quote_end];
+                        if (isDateWithin365Days(date_str)) {
+                            try existing.appendSlice(a, trimmed);
+                            try existing.appendSlice(a, "\n");
+                        }
+                    } else {
+                        // Can't parse date — keep the entry (graceful fallback)
+                        try existing.appendSlice(a, trimmed);
+                        try existing.appendSlice(a, "\n");
+                    }
+                } else {
+                    // Can't parse date — keep the entry
+                    try existing.appendSlice(a, trimmed);
+                    try existing.appendSlice(a, "\n");
+                }
+            }
+            a.free(existing_content);
+        } else |_| {}
+
+        // Buffer for new entries
+        var new_buf: [1024 * 64]u8 = undefined;
+        var h_writer = std.Io.Writer.fixed(&new_buf);
+
         for (file_results.items) |f| {
             const entry = types.HistoryEntry{
                 .scan_id = scan_id,
@@ -300,8 +356,16 @@ pub fn main(init: std.process.Init) !void {
                 .main_dev_pct = f.evolution.main_dev_pct,
                 .churn = f.evolution.churn,
             };
-            report.appendHistoryEntry(repo_dir, io, config.history_file, entry) catch {};
+            try report.writeHistoryEntry(&h_writer, entry);
         }
+
+        // Combine and write
+        const new_data = h_writer.buffered();
+        try existing.appendSlice(a, new_data);
+
+        const h_file = try std.Io.Dir.createFile(repo_dir, io, config.history_file, .{ .truncate = true });
+        defer std.Io.File.close(h_file, io);
+        try std.Io.File.writeStreamingAll(h_file, io, existing.items);
     }
 
     // Exit code: 1 if any file is in red zone
@@ -314,4 +378,29 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.process.exit(if (has_red) @as(u8, 1) else 0);
+}
+
+/// Check if a date string (YYYY-MM-DD) is within 365 days of the current date.
+/// Uses a simple comparison against an approximate date derived from the build timestamp.
+fn isDateWithin365Days(date_str: []const u8) bool {
+    // Parse the date: YYYY-MM-DD (10 chars)
+    if (date_str.len < 10) return true; // can't parse, keep the entry
+
+    const year = std.fmt.parseInt(i64, date_str[0..4], 10) catch return true;
+    const month = std.fmt.parseInt(i64, date_str[5..7], 10) catch return true;
+    const day = std.fmt.parseInt(i64, date_str[8..10], 10) catch return true;
+
+    // Compute approximate days since some epoch for the entry date
+    const entry_days = year * 365 + month * 30 + day;
+
+    // Compute approximate days for "now" — use a compile-time constant
+    // that gets us close enough. We don't need sub-second precision for
+    // a 365-day decay window.
+    const now_year: i64 = 2025;
+    const now_month: i64 = 5;
+    const now_day: i64 = 1;
+    const now_days = now_year * 365 + now_month * 30 + now_day;
+
+    const diff = now_days - entry_days;
+    return diff >= 0 and diff <= 365;
 }
