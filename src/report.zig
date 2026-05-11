@@ -187,6 +187,35 @@ pub fn writeMarkdownReport(
     try w.print("| 🟠 Orange | {d} |\n", .{orange_count});
     try w.print("| 🔴 Red | {d} |\n\n", .{red_count});
 
+    // Expandable reference explaining zones and signals
+    try w.writeAll("<details>\n");
+    try w.writeAll("<summary>📖 Understanding the Report — Zones &amp; Signals</summary>\n\n");
+    try w.writeAll("Each file in the table below is scored on six signals. Every signal is classified into a **zone** (1–4) based on auto-calibrated percentile thresholds from the entire repository.\n\n");
+    try w.writeAll("### Zone Colors\n\n");
+    try w.writeAll("| Zone | Color | Percentile | Meaning |\n");
+    try w.writeAll("|------|-------|------------|---------|\n");
+    try w.writeAll("| 🟢 **Green** | 1 | ≥ p95 | Low risk — within normal bounds |\n");
+    try w.writeAll("| 🟡 **Yellow** | 2 | p85 – p95 | Elevated — worth monitoring |\n");
+    try w.writeAll("| 🟠 **Orange** | 3 | p60 – p85 | Warning — above typical range |\n");
+    try w.writeAll("| 🔴 **Red** | 4 | < p60 | Critical — top tier of concern |\n\n");
+    try w.writeAll("Percentiles are computed from the current snapshot of all tracked files. A **red** file is in the worst ~40% of the codebase for that signal; a **green** file is in the best ~5%.\n\n");
+    try w.writeAll("### Signal Definitions\n\n");
+    try w.writeAll("| Signal | Formula | What It Detects |\n");
+    try w.writeAll("|--------|---------|------------------|\n");
+    try w.writeAll("| **Hotspot** | `revisions × indent_mean` | Files that change often and are deeply nested — painful to maintain |\n");
+    try w.writeAll("| **Complexity** | `indent_mean` | Average nesting depth; higher values indicate tangled control flow |\n");
+    try w.writeAll("| **Revisions** | `revision count` | How many commits touched this file — churn-prone code |\n");
+    try w.writeAll("| **Authors** | `distinct author count` | Many authors = diffusion of ownership |\n");
+    try w.writeAll("| **Congestion** | `authors / revisions` | High ratio means many people edit a file that changes infrequently — coordination bottleneck |\n");
+    try w.writeAll("| **Risk*** | `indent_mean × (1 - main_dev_pct)` | Complex code where no single author dominates — knowledge-loss danger |\n\n");
+    try w.writeAll("### How to Use This\n\n");
+    try w.writeAll("- **Red** files should be reviewed and refactored as soon as feasible.\n");
+    try w.writeAll("- **Orange** files are trending toward red — schedule a review in the next iteration.\n");
+    try w.writeAll("- **Yellow** files are above average but not urgent — keep an eye on them.\n");
+    try w.writeAll("- **Green** files are fine; no action needed.\n\n");
+    try w.writeAll("The **Risk** column combines complexity with knowledge-loss potential. A red risk zone means the file is complex *and* lacks a clear primary owner — if the main developer leaves, that knowledge is gone.\n\n");
+    try w.writeAll("</details>\n\n");
+
     try w.writeAll("### Files\n\n");
     try w.writeAll("| File | Hotspot | Complexity | Revisions | Authors | Congestion | Risk |\n");
     try w.writeAll("|------|---------|------------|-----------|--------|------------|------|\n");
