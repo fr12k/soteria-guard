@@ -6,91 +6,97 @@ fn matchesGlob(path: []const u8, pattern: []const u8) bool {
     const p = path;
     const pat = pattern;
 
-    // Use two pointers — pi for pattern index, si for string index
-    // with backtracking for `*` via saved positions.
     var pi: usize = 0;
     var si: usize = 0;
     var star_pi: ?usize = null;
     var star_si: ?usize = null;
 
     while (si < p.len) {
-        if (pi < pat.len and (pat[pi] == p[si] or pat[pi] == '?')) {
-            // Match single char (or literally)
-            if (pat[pi] == '?' and p[si] == '/') {
-                // `?` does NOT match separator
-            } else {
-                pi += 1;
-                si += 1;
-                continue;
-            }
-        }
+        // Case 1: literal or ? match (no backtrack state change)
+        if (tryLiteralMatch(&pi, &si, p, pat)) continue;
 
-        if (pi < pat.len and pat[pi] == '*') {
-            // Handle `**` vs `*`
-            if (pi + 1 < pat.len and pat[pi + 1] == '*') {
-                // `**` matches everything including separators
-                // Try to match rest of pattern starting at current position
-                // or skip characters
-                star_pi = pi + 2; // past `**`
-                star_si = si;
-                pi = star_pi.?;
-                // If pattern ends with `**`, it's a match
-                if (pi >= pat.len) return true;
-                continue;
-            } else {
-                // `*` matches any non-separator characters
-                // Try to match rest of pattern at current position or skip
-                // But `*` cannot cross separator boundaries
-                star_pi = pi + 1;
-                star_si = si;
-                pi = star_pi.?;
-                continue;
-            }
-        }
-
-        // Mismatch: backtrack if we had a star
-        if (star_pi) |sp| {
-            // If the last star was `*` (not `**`), ensure no separator crossing
-            // Check if we're crossing a separator since the star_si
-            if (sp > 0 and sp < pat.len and pat[sp - 1] == '*' and !(sp > 1 and pat[sp - 2] == '*')) {
-                // This was a single `*` — check if p[star_si..si] contains a separator
-                var j = star_si.?;
-                while (j < si) : (j += 1) {
-                    if (p[j] == '/') {
-                        // `*` can't cross separator, but try to resume after the separator
-                        // Actually, `*` within the same component — if there's a separator
-                        // we need to fail this branch.
-                        // Reset: move past the separator
-                        star_si = j + 1;
-                        pi = sp;
-                        si = star_si.?;
-                        continue;
-                    }
-                }
-            }
-            star_si = star_si.? + 1;
-            si = star_si.?;
-            pi = sp;
+        // Case 2: * or ** — consume and set backtrack state
+        if (tryConsumeStar(&pi, si, pat, &star_pi, &star_si)) {
+            if (pi >= pat.len) return true; // `*` or `**` at end matches everything
             continue;
         }
+
+        // Case 3: mismatch — try backtracking over previously consumed star
+        if (tryStarBacktrack(&si, p, pat, star_pi, &star_si, &pi)) continue;
 
         return false;
     }
 
-    // Skip remaining `*` / `**` in pattern
-    while (pi < pat.len) {
-        if (pat[pi] == '*') {
-            if (pi + 1 < pat.len and pat[pi + 1] == '*') {
-                pi += 2;
-            } else {
-                pi += 1;
-            }
-        } else {
-            break;
+    return consumeTrailingStars(&pi, pat);
+}
+
+/// Try matching a literal character or `?` at current positions. Advances pi, si on success.
+fn tryLiteralMatch(pi: *usize, si: *usize, p: []const u8, pat: []const u8) bool {
+    if (pi.* >= pat.len) return false;
+    if (pat[pi.*] != p[si.*] and pat[pi.*] != '?') return false;
+    if (pat[pi.*] == '?' and p[si.*] == '/') return false;
+    pi.* += 1;
+    si.* += 1;
+    return true;
+}
+
+/// Consume `*` or `**` at current pattern position. Sets backtrack state on success.
+fn tryConsumeStar(pi: *usize, si: usize, pat: []const u8, star_pi: *?usize, star_si: *?usize) bool {
+    if (pi.* >= pat.len) return false;
+    if (pat[pi.*] != '*') return false;
+
+    const step: usize = if (pi.* + 1 < pat.len and pat[pi.* + 1] == '*') @as(usize, 2) else 1;
+    star_pi.* = pi.* + step;
+    star_si.* = si;
+    pi.* = star_pi.*.?;
+    return true;
+}
+
+/// Skip trailing `*` / `**` that remain after the path is exhausted.
+fn consumeTrailingStars(pi: *usize, pat: []const u8) bool {
+    while (pi.* < pat.len) : (pi.* += 1) {
+        if (pat[pi.*] == '*' and pi.* + 1 < pat.len and pat[pi.* + 1] == '*') pi.* += 1;
+        if (pat[pi.*] != '*') return false;
+    }
+    return true;
+}
+
+/// Backtrack from a star match. Resets si past separator for single-`*` stars.
+fn tryStarBacktrack(si: *usize, p: []const u8, pat: []const u8, star_pi: ?usize, star_si: *?usize, pi: *usize) bool {
+    if (star_pi == null) return false;
+    const sp = star_pi.?;
+
+    // Single `*` cannot cross directory separator
+    if (startsWithSingleStar(pat, sp)) {
+        if (nextPastSeparator(si.*, p, star_si.*.?)) |new_si| {
+            star_si.* = new_si;
+            si.* = new_si;
+            pi.* = sp;
+            return true;
         }
     }
 
-    return pi >= pat.len;
+    star_si.* = star_si.*.? + 1;
+    si.* = star_si.*.?;
+    pi.* = sp;
+    return true;
+}
+
+/// Check whether the star at position sp in pattern is a single `*` (not `**`).
+fn startsWithSingleStar(pat: []const u8, sp: usize) bool {
+    if (sp == 0) return pat[0] == '*';
+    if (pat[sp - 1] != '*') return true;
+    if (sp > 1 and pat[sp - 2] == '*') return false; // `**`
+    return false; // sp points past a `*`, and it's part of `**`
+}
+
+/// Find the next `/` separator in p[start..si_end], return index just past it.
+fn nextPastSeparator(si_end: usize, p: []const u8, start: usize) ?usize {
+    var j: usize = start;
+    while (j < si_end) : (j += 1) {
+        if (p[j] == '/') return j + 1;
+    }
+    return null;
 }
 
 /// Returns true if `path` matches any of the ignore patterns.
@@ -190,4 +196,49 @@ test "shouldIgnore with patterns" {
     try std.testing.expect(shouldIgnore("vendor/lib/foo.zig", &patterns));
     try std.testing.expect(shouldIgnore("generated.pb.go", &patterns));
     try std.testing.expect(!shouldIgnore("src/main.zig", &patterns));
+}
+
+// ── Edge-case coverage for refactor plan Step F ──
+
+test "matchesGlob double_star prefix" {
+    // `**/` prefix — matches any depth directory
+    try std.testing.expect(matchesGlob("src/main.zig", "**/main.zig"));
+    try std.testing.expect(matchesGlob("deep/nested/main.zig", "**/main.zig"));
+    try std.testing.expect(matchesGlob("main.zig", "**/main.zig"));
+    try std.testing.expect(!matchesGlob("src/main.rs", "**/main.zig"));
+}
+
+test "matchesGlob trailing slash" {
+    // Trailing `/` in pattern should be handled
+    try std.testing.expect(matchesGlob("vendor/lib", "vendor/lib/"));
+    try std.testing.expect(!matchesGlob("vendor/libx", "vendor/lib/"));
+}
+
+test "matchesGlob exact match literal" {
+    try std.testing.expect(matchesGlob("foo/bar.zig", "foo/bar.zig"));
+    try std.testing.expect(!matchesGlob("foo/baz.zig", "foo/bar.zig"));
+}
+
+test "matchesGlob star suffix and prefix" {
+    try std.testing.expect(matchesGlob("main.zig", "*.zig"));
+    try std.testing.expect(matchesGlob("test.zig", "test.*"));
+    try std.testing.expect(matchesGlob("foo.bar.zig", "foo.*.zig"));
+    try std.testing.expect(!matchesGlob("foo.bar.rs", "foo.*.zig"));
+}
+
+test "matchesGlob mixed star and double_star" {
+    try std.testing.expect(matchesGlob("a/b/c/d.zig", "**/*.zig"));
+    try std.testing.expect(matchesGlob("root.zig", "**/*.zig"));
+    try std.testing.expect(!matchesGlob("a/b/c/d.rs", "**/*.zig"));
+}
+
+test "shouldIgnore empty patterns" {
+    const empty = [_][]const u8{};
+    try std.testing.expect(!shouldIgnore("anything.zig", &empty));
+}
+
+test "shouldIgnore no match" {
+    const patterns = [_][]const u8{ "*.go", "vendor/**" };
+    try std.testing.expect(!shouldIgnore("src/main.zig", &patterns));
+    try std.testing.expect(!shouldIgnore("build.zig", &patterns));
 }

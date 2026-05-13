@@ -148,6 +148,10 @@ pub const HistoryEntry = struct {
     authors: u32,
     main_dev_pct: f64,
     churn: u32,
+    /// Pre-computed derived signals (default to 0.0 for backward compat)
+    hotspot_score: f64 = 0.0,
+    knowledge_loss_risk: f64 = 0.0,
+    developer_congestion: f64 = 0.0,
 };
 
 // ── CLI configuration ──
@@ -162,6 +166,12 @@ pub const CliConfig = struct {
     thresholds_file: []const u8 = ".soteria/thresholds.json",
     ignore_file: []const u8 = ".guardrailignore",
     verbose: bool = false,
+    /// Minimum number of files with > calibrate_min_revisions revisions
+    /// required before percentile calibration kicks in. Below this,
+    /// fallback hard-coded thresholds are used instead.
+    calibrate_min_files: u32 = 5,
+    /// Minimum revision count a file needs to count toward calibrate_min_files.
+    calibrate_min_revisions: u32 = 5,
 };
 
 // ── Full scan report ──
@@ -173,6 +183,7 @@ pub const Report = struct {
     files: []FileResult,
     couplings: []CouplingPair,
     thresholds: Thresholds,
+    calibration: []const u8 = "fallback",
 };
 
 // ── Source extension whitelist ──
@@ -189,4 +200,12 @@ pub fn hasSourceExtension(path: []const u8) bool {
         if (std.mem.eql(u8, ext, valid)) return true;
     }
     return false;
+}
+
+/// Open a directory, handling both absolute and relative paths.
+pub fn openRepoDir(io: std.Io, path: []const u8) !std.Io.Dir {
+    return if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
+    else
+        try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, path, .{ .iterate = true });
 }

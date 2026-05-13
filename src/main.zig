@@ -40,6 +40,12 @@ fn parseArgs(
             config.thresholds_file = try a.dupe(u8, args_iter.next() orelse return error.MissingArg);
         } else if (std.mem.eql(u8, arg, "--ignore")) {
             config.ignore_file = try a.dupe(u8, args_iter.next() orelse return error.MissingArg);
+        } else if (std.mem.eql(u8, arg, "--calibrate-min-files")) {
+            const val = args_iter.next() orelse return error.MissingArg;
+            config.calibrate_min_files = std.fmt.parseUnsigned(u32, val, 10) catch return error.InvalidArg;
+        } else if (std.mem.eql(u8, arg, "--calibrate-min-revisions")) {
+            const val = args_iter.next() orelse return error.MissingArg;
+            config.calibrate_min_revisions = std.fmt.parseUnsigned(u32, val, 10) catch return error.InvalidArg;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
@@ -88,12 +94,191 @@ fn printHelp(io: std.Io) void {
         \\  --thresholds <file>   Path to write threshold snapshot (JSON)
         \\                        (default: .soteria/thresholds.json)
         \\  --ignore <file>       Path to .guardrailignore (default: .guardrailignore)
+        \\  --calibrate-min-files <n>  Min files with >min-revisions for percentile
+        \\                              calibration (default: 5)
+        \\  --calibrate-min-revisions <n>  Min revisions per file to count toward
+        \\                                  calibrate-min-files (default: 5)
         \\  --verbose             Print progress to stderr
         \\  --version             Print version and exit
         \\  --help                Print help and exit
         \\
     ) catch {};
     out.flush() catch {};
+}
+
+/// Render `data` with `renderFn` into a fixed buffer, then write to `path`.
+fn writeFile(
+    dir: std.Io.Dir,
+    io: std.Io,
+    path: []const u8,
+    comptime BufSize: comptime_int,
+    data: anytype,
+    comptime renderFn: anytype,
+) !void {
+    var buf: [BufSize]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderFn(&w, data);
+
+    const file = try std.Io.Dir.createFile(dir, io, path, .{});
+    defer std.Io.File.close(file, io);
+    try std.Io.File.writeStreamingAll(file, io, w.buffered());
+}
+
+/// Combine scanned file metrics with git evolution data into FileResults.
+fn mergeFileResults(
+    a: std.mem.Allocator,
+    file_metrics_list: []const types.FileMetrics,
+    time_series_list: []const git_log.PerFileTimeSeries,
+    evolution_list: []const types.EvolutionMetrics,
+) !std.ArrayList(types.FileResult) {
+    var path_to_evo = std.StringHashMap(usize).init(a);
+    defer path_to_evo.deinit();
+
+    for (evolution_list, 0..) |_, i| {
+        if (i < time_series_list.len) {
+            try path_to_evo.put(time_series_list[i].path, i);
+        }
+    }
+
+    var file_results = std.ArrayList(types.FileResult).empty;
+    errdefer file_results.deinit(a);
+
+    for (file_metrics_list) |fm| {
+        var evo = types.EvolutionMetrics{
+            .revisions = 0,
+            .authors = 0,
+            .churn = 0,
+            .entity_effort = 0,
+            .main_dev_pct = 0,
+        };
+        var trend_val: f64 = 0;
+
+        if (path_to_evo.get(fm.path)) |evo_idx| {
+            evo = evolution_list[evo_idx];
+            if (evo_idx < time_series_list.len) {
+                trend_val = trend.computeTrend(time_series_list[evo_idx].complexity_series.items);
+            }
+        }
+
+        const sig = signals_mod.computeSignals(fm, evo, trend_val);
+
+        try file_results.append(a, .{
+            .metrics = fm,
+            .evolution = evo,
+            .signals = sig,
+            .hotspot_zone = .green,
+            .complexity_zone = .green,
+            .revisions_zone = .green,
+            .authors_zone = .green,
+            .congestion_zone = .green,
+            .risk_zone = .green,
+        });
+    }
+
+    return file_results;
+}
+
+/// Print a short summary to stdout.
+fn writeStdoutSummary(
+    io: std.Io,
+    project: []const u8,
+    window: []const u8,
+    files: []const types.FileResult,
+) !void {
+    const stdout_file = std.Io.File.stdout();
+    var buf: [4096]u8 = undefined;
+    var w = stdout_file.writer(io, &buf);
+    const out = &w.interface;
+    try out.writeAll("## soteria — Code Quality Guardrail Report\n\n");
+    try out.print("Project: {s}\n", .{project});
+    try out.print("Window: {s}\n\n", .{window});
+
+    var red_count: usize = 0;
+    for (files) |f| {
+        if (f.hotspot_zone == .red) red_count += 1;
+    }
+
+    try out.print("Files scanned: {d}\n", .{files.len});
+    try out.print("Critical (red): {d}\n", .{red_count});
+
+    if (red_count > 0) {
+        try out.writeAll("\n🚫 Critical files:\n");
+        for (files) |f| {
+            if (f.hotspot_zone == .red) {
+                try out.print("  - {s} (hotspot: {d:.1})\n", .{ f.metrics.path, f.signals.hotspot_score });
+            }
+        }
+    }
+
+    try out.writeAll("\nDone.\n");
+    try out.flush();
+}
+
+/// Append current scan entries to history DB, dropping records older than 365 days.
+fn filterAndWriteHistory(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repo_dir: std.Io.Dir,
+    history_path: []const u8,
+    scan_id: []const u8,
+    files: []const types.FileResult,
+) !void {
+    var existing = std.ArrayList(u8).empty;
+    defer existing.deinit(a);
+
+    if (std.Io.Dir.readFileAlloc(repo_dir, io, history_path, a, std.Io.Limit.unlimited)) |existing_content| {
+        var lines = std.mem.splitScalar(u8, existing_content, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            if (std.mem.indexOf(u8, trimmed, "\"date\":\"")) |date_start| {
+                const val_start = date_start + 8;
+                if (std.mem.indexOfScalar(u8, trimmed[val_start..], '"')) |quote_end| {
+                    const date_str = trimmed[val_start .. val_start + quote_end];
+                    if (isDateWithin365Days(date_str)) {
+                        try existing.appendSlice(a, trimmed);
+                        try existing.appendSlice(a, "\n");
+                    }
+                } else {
+                    try existing.appendSlice(a, trimmed);
+                    try existing.appendSlice(a, "\n");
+                }
+            } else {
+                try existing.appendSlice(a, trimmed);
+                try existing.appendSlice(a, "\n");
+            }
+        }
+        a.free(existing_content);
+    } else |_| {}
+
+    var new_buf: [1024 * 64]u8 = undefined;
+    var h_writer = std.Io.Writer.fixed(&new_buf);
+
+    for (files) |f| {
+        const entry = types.HistoryEntry{
+            .scan_id = scan_id,
+            .file = f.metrics.path,
+            .date = "unknown-date",
+            .loc = f.metrics.loc,
+            .indent_mean = f.metrics.indent_mean,
+            .indent_max = f.metrics.indent_max,
+            .revisions = f.evolution.revisions,
+            .authors = f.evolution.authors,
+            .main_dev_pct = f.evolution.main_dev_pct,
+            .churn = f.evolution.churn,
+            .hotspot_score = f.signals.hotspot_score,
+            .knowledge_loss_risk = f.signals.knowledge_loss_risk,
+            .developer_congestion = f.signals.developer_congestion,
+        };
+        try report.writeHistoryEntry(&h_writer, entry);
+    }
+
+    const new_data = h_writer.buffered();
+    try existing.appendSlice(a, new_data);
+
+    const h_file = try std.Io.Dir.createFile(repo_dir, io, history_path, .{ .truncate = true });
+    defer std.Io.File.close(h_file, io);
+    try std.Io.File.writeStreamingAll(h_file, io, existing.items);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -112,12 +297,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Open repo directory
-    const repo_dir = if (std.fs.path.isAbsolute(config.path)) dir: {
-        break :dir try std.Io.Dir.openDirAbsolute(io, config.path, .{ .iterate = true });
-    } else dir: {
-        // Open relative to CWD
-        break :dir try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, config.path, .{ .iterate = true });
-    };
+    const repo_dir = try types.openRepoDir(io, config.path);
     defer std.Io.Dir.close(repo_dir, io);
 
     // Ensure .soteria directory exists
@@ -161,62 +341,35 @@ pub fn main(init: std.process.Init) !void {
     var coupling_pairs = try coupling.computeCoupling(a, commit_files_list.items, config.verbose);
     errdefer coupling_pairs.deinit(a);
 
-    // ── Step 4: Build path → evolution lookup, then merge into FileResults ──
-    var path_to_evo = std.StringHashMap(usize).init(a);
-    defer path_to_evo.deinit();
-
-    for (evolution_list.items, 0..) |_, i| {
-        if (i < time_series_list.items.len) {
-            try path_to_evo.put(time_series_list.items[i].path, i);
-        }
-    }
-
-    var file_results = std.ArrayList(types.FileResult).empty;
+    // ── Step 4: Merge metrics + evolution into FileResults ──
+    var file_results = try mergeFileResults(a, file_metrics_list.items, time_series_list.items, evolution_list.items);
     errdefer file_results.deinit(a);
 
-    for (file_metrics_list.items) |fm| {
-        // Default values for files without git history
-        var evo = types.EvolutionMetrics{
-            .revisions = 0,
-            .authors = 0,
-            .churn = 0,
-            .entity_effort = 0,
-            .main_dev_pct = 0,
-        };
-        var trend_val: f64 = 0;
+    // ── Step 5: Calibrate thresholds and assign zones ──
+    const cal = try thresholds_mod.calibrateThresholds(a, file_results.items, config.calibrate_min_files, config.calibrate_min_revisions);
+    const thresholds = cal.thresholds;
+    thresholds_mod.assignAllZones(file_results.items, cal.thresholds);
 
-        // Look up evolution metrics by file path
-        if (path_to_evo.get(fm.path)) |evo_idx| {
-            evo = evolution_list.items[evo_idx];
-
-            // Compute trend from the time series
-            if (evo_idx < time_series_list.items.len) {
-                trend_val = trend.computeTrend(time_series_list.items[evo_idx].complexity_series.items);
-            }
-        }
-
-        const sig = signals_mod.computeSignals(fm, evo, trend_val);
-
-        try file_results.append(a, .{
-            .metrics = fm,
-            .evolution = evo,
-            .signals = sig,
-            .hotspot_zone = .green,
-            .complexity_zone = .green,
-            .revisions_zone = .green,
-            .authors_zone = .green,
-            .congestion_zone = .green,
-            .risk_zone = .green,
-        });
+    if (config.verbose and cal.method == .fallback) {
+        std.debug.print("  thresholds: using fallback (only {d} files with >= {d} revisions, need {d})\n", .{ cal.mature_file_count, config.calibrate_min_revisions, config.calibrate_min_files });
+    } else if (config.verbose) {
+        std.debug.print("  thresholds: percentile calibration ({d} mature files)\n", .{cal.mature_file_count});
     }
 
-    // ── Step 5: Calibrate thresholds and assign zones ──
-    const thresholds = thresholds_mod.calibrateThresholds(file_results.items);
-    thresholds_mod.assignAllZones(file_results.items, thresholds);
-
-    // ── Step 6: Write outputs ──
     const scan_id = "live";
 
+    // ── Step 5b: Write hotspot.json snapshot ──
+    {
+        const hf = try std.Io.Dir.createFile(repo_dir, io, ".soteria/hotspot.json", .{});
+        defer std.Io.File.close(hf, io);
+
+        var buf: [32768]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try report.writeHotspotJson(&w, scan_id, thresholds, @tagName(cal.method), file_results.items, a);
+        try std.Io.File.writeStreamingAll(hf, io, w.buffered());
+    }
+
+    // ── Step 6: Write outputs ──
     const report_data = types.Report{
         .project_path = config.path,
         .scan_id = scan_id,
@@ -224,73 +377,26 @@ pub fn main(init: std.process.Init) !void {
         .files = file_results.items,
         .couplings = coupling_pairs.items,
         .thresholds = thresholds,
+        .calibration = @tagName(cal.method),
     };
 
     // Stdout summary
-    {
-        const stdout_file = std.Io.File.stdout();
-        var buf: [4096]u8 = undefined;
-        var w = stdout_file.writer(io, &buf);
-        const out = &w.interface;
-        try out.writeAll("## soteria — Code Quality Guardrail Report\n\n");
-        try out.print("Project: {s}\n", .{config.path});
-        try out.print("Window: {s}\n\n", .{config.after});
-
-        var red_count: usize = 0;
-        for (file_results.items) |f| {
-            if (f.hotspot_zone == .red) red_count += 1;
-        }
-
-        try out.print("Files scanned: {d}\n", .{file_results.items.len});
-        try out.print("Critical (red): {d}\n", .{red_count});
-
-        if (red_count > 0) {
-            try out.writeAll("\n🚫 Critical files:\n");
-            for (file_results.items) |f| {
-                if (f.hotspot_zone == .red) {
-                    try out.print("  - {s} (hotspot: {d:.1})\n", .{ f.metrics.path, f.signals.hotspot_score });
-                }
-            }
-        }
-
-        try out.writeAll("\nDone.\n");
-        try out.flush();
-    }
+    try writeStdoutSummary(io, config.path, config.after, file_results.items);
 
     // Write JSON report
     if (config.out_file) |out_path| {
-        var out_buf: [1024 * 256]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&out_buf);
-        try report.writeJsonReport(&writer, report_data);
-
-        const out_file = try std.Io.Dir.createFile(repo_dir, io, out_path, .{});
-        defer std.Io.File.close(out_file, io);
-        try std.Io.File.writeStreamingAll(out_file, io, writer.buffered());
+        try writeFile(repo_dir, io, out_path, 1024 * 256, report_data, report.writeJsonReport);
     }
 
     // Write Markdown report
     if (config.out_markdown) |md_path| {
-        var md_buf: [1024 * 256]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&md_buf);
-        try report.writeMarkdownReport(&writer, report_data);
-
-        const md_file = try std.Io.Dir.createFile(repo_dir, io, md_path, .{});
-        defer std.Io.File.close(md_file, io);
-        try std.Io.File.writeStreamingAll(md_file, io, writer.buffered());
+        try writeFile(repo_dir, io, md_path, 1024 * 256, report_data, report.writeMarkdownReport);
     }
 
     // Write thresholds snapshot
-    {
-        var th_buf: [4096]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&th_buf);
-        try report.writeThresholdsJson(&writer, thresholds);
+    try writeFile(repo_dir, io, config.thresholds_file, 4096, thresholds, report.writeThresholdsJson);
 
-        const th_file = try std.Io.Dir.createFile(repo_dir, io, config.thresholds_file, .{});
-        defer std.Io.File.close(th_file, io);
-        try std.Io.File.writeStreamingAll(th_file, io, writer.buffered());
-    }
-
-    // Write coupling matrix (only if non-empty) — write directly to file
+    // Write coupling matrix (only if non-empty)
     if (coupling_pairs.items.len > 0) {
         const cp_file = try std.Io.Dir.createFile(repo_dir, io, config.coupling_file, .{});
         defer std.Io.File.close(cp_file, io);
@@ -301,72 +407,8 @@ pub fn main(init: std.process.Init) !void {
         try cp_writer.interface.flush();
     }
 
-    // Write all history DB entries in a single file append operation
-    // With decay: entries older than 12 months are dropped
-    {
-        var existing = std.ArrayList(u8).empty;
-        defer existing.deinit(a);
-
-        // Try to read existing history file and filter out old entries
-        if (std.Io.Dir.readFileAlloc(repo_dir, io, config.history_file, a, std.Io.Limit.unlimited)) |existing_content| {
-            // Filter: keep only entries from the last 12 months
-            // Each line is JSON; extract the date field (YYYY-MM-DD) and compare
-            var lines = std.mem.splitScalar(u8, existing_content, '\n');
-            while (lines.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \t\r");
-                if (trimmed.len == 0) continue;
-                // Try to extract date: "date":"YYYY-MM-DD"
-                // Search for the date field pattern
-                if (std.mem.indexOf(u8, trimmed, "\"date\":\"")) |date_start| {
-                    const val_start = date_start + 8; // past "date":"
-                    if (std.mem.indexOfScalar(u8, trimmed[val_start..], '"')) |quote_end| {
-                        const date_str = trimmed[val_start .. val_start + quote_end];
-                        if (isDateWithin365Days(date_str)) {
-                            try existing.appendSlice(a, trimmed);
-                            try existing.appendSlice(a, "\n");
-                        }
-                    } else {
-                        // Can't parse date — keep the entry (graceful fallback)
-                        try existing.appendSlice(a, trimmed);
-                        try existing.appendSlice(a, "\n");
-                    }
-                } else {
-                    // Can't parse date — keep the entry
-                    try existing.appendSlice(a, trimmed);
-                    try existing.appendSlice(a, "\n");
-                }
-            }
-            a.free(existing_content);
-        } else |_| {}
-
-        // Buffer for new entries
-        var new_buf: [1024 * 64]u8 = undefined;
-        var h_writer = std.Io.Writer.fixed(&new_buf);
-
-        for (file_results.items) |f| {
-            const entry = types.HistoryEntry{
-                .scan_id = scan_id,
-                .file = f.metrics.path,
-                .date = "unknown-date",
-                .loc = f.metrics.loc,
-                .indent_mean = f.metrics.indent_mean,
-                .indent_max = f.metrics.indent_max,
-                .revisions = f.evolution.revisions,
-                .authors = f.evolution.authors,
-                .main_dev_pct = f.evolution.main_dev_pct,
-                .churn = f.evolution.churn,
-            };
-            try report.writeHistoryEntry(&h_writer, entry);
-        }
-
-        // Combine and write
-        const new_data = h_writer.buffered();
-        try existing.appendSlice(a, new_data);
-
-        const h_file = try std.Io.Dir.createFile(repo_dir, io, config.history_file, .{ .truncate = true });
-        defer std.Io.File.close(h_file, io);
-        try std.Io.File.writeStreamingAll(h_file, io, existing.items);
-    }
+    // Write history DB
+    try filterAndWriteHistory(a, io, repo_dir, config.history_file, scan_id, file_results.items);
 
     // Exit code: 1 if any file is in red zone
     var has_red: bool = false;

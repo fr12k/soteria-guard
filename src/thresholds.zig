@@ -38,19 +38,19 @@ pub fn percentile(sorted_values: []f64, p: f64) f64 {
 }
 
 /// Compute percentile thresholds from a slice of f64 values.
-/// Returns (p60, p85, p95).
-pub fn computeThresholds(values: []f64) struct { f64, f64, f64 } {
+/// Returns (p60, p85, p95). Propagates allocation errors.
+pub fn computeThresholds(a: std.mem.Allocator, values: []f64) !struct { f64, f64, f64 } {
     if (values.len == 0) return .{ 0.0, 0.0, 0.0 };
 
     // Sort a copy
     var sorted = std.ArrayList(f64).empty;
-    defer sorted.deinit(std.heap.page_allocator);
+    defer sorted.deinit(a);
     for (values) |v| {
-        sorted.append(std.heap.page_allocator, v) catch {};
+        try sorted.append(a, v);
     }
     std.mem.sort(f64, sorted.items, {}, struct {
-        fn lessThan(_: void, a: f64, b: f64) bool {
-            return a < b;
+        fn lessThan(_: void, x: f64, y: f64) bool {
+            return x < y;
         }
     }.lessThan);
 
@@ -69,46 +69,77 @@ pub fn assignZone(value: f64, p60: f64, p85: f64, p95: f64) types.Zone {
     return .green;
 }
 
-/// Build the full Thresholds struct by computing percentiles from file results.
-pub fn calibrateThresholds(files: []types.FileResult) types.Thresholds {
-    if (files.len == 0) return fallbackThresholds();
+pub const Calibration = struct {
+    thresholds: types.Thresholds,
+    method: CalibrationMethod,
+    mature_file_count: u32,
 
+    pub const CalibrationMethod = enum { percentile, fallback };
+};
+
+/// Build the full Thresholds struct by computing percentiles from file results.
+/// If fewer than `min_files` files have >= `min_revisions` revisions,
+/// percentile calibration is skipped and conservative fallback thresholds are used.
+/// Only files meeting the revision threshold are used for percentile computation.
+pub fn calibrateThresholds(
+    a: std.mem.Allocator,
+    files: []types.FileResult,
+    min_files: u32,
+    min_revisions: u32,
+) !Calibration {
+    if (files.len == 0) return .{ .thresholds = fallbackThresholds(), .method = .fallback, .mature_file_count = 0 };
+
+    // Count files with enough revisions for meaningful calibration.
+    var mature_files: u32 = 0;
+    for (files) |f| {
+        if (f.evolution.revisions >= min_revisions) {
+            mature_files += 1;
+        }
+    }
+    if (mature_files < min_files) return .{ .thresholds = fallbackThresholds(), .method = .fallback, .mature_file_count = mature_files };
+
+    // Collect metric values from mature files only.
     var hotspot_scores = std.ArrayList(f64).empty;
-    defer hotspot_scores.deinit(std.heap.page_allocator);
+    defer hotspot_scores.deinit(a);
     var complexity_vals = std.ArrayList(f64).empty;
-    defer complexity_vals.deinit(std.heap.page_allocator);
+    defer complexity_vals.deinit(a);
     var revisions_vals = std.ArrayList(f64).empty;
-    defer revisions_vals.deinit(std.heap.page_allocator);
+    defer revisions_vals.deinit(a);
     var authors_vals = std.ArrayList(f64).empty;
-    defer authors_vals.deinit(std.heap.page_allocator);
+    defer authors_vals.deinit(a);
     var congestion_vals = std.ArrayList(f64).empty;
-    defer congestion_vals.deinit(std.heap.page_allocator);
+    defer congestion_vals.deinit(a);
     var risk_vals = std.ArrayList(f64).empty;
-    defer risk_vals.deinit(std.heap.page_allocator);
+    defer risk_vals.deinit(a);
 
     for (files) |f| {
-        hotspot_scores.append(std.heap.page_allocator, f.signals.hotspot_score) catch {};
-        complexity_vals.append(std.heap.page_allocator, f.metrics.indent_mean) catch {};
-        revisions_vals.append(std.heap.page_allocator, @floatFromInt(f.evolution.revisions)) catch {};
-        authors_vals.append(std.heap.page_allocator, @floatFromInt(f.evolution.authors)) catch {};
-        congestion_vals.append(std.heap.page_allocator, f.signals.developer_congestion) catch {};
-        risk_vals.append(std.heap.page_allocator, f.signals.knowledge_loss_risk) catch {};
+        if (f.evolution.revisions < min_revisions) continue;
+        try hotspot_scores.append(a, f.signals.hotspot_score);
+        try complexity_vals.append(a, f.metrics.indent_mean);
+        try revisions_vals.append(a, @floatFromInt(f.evolution.revisions));
+        try authors_vals.append(a, @floatFromInt(f.evolution.authors));
+        try congestion_vals.append(a, f.signals.developer_congestion);
+        try risk_vals.append(a, f.signals.knowledge_loss_risk);
     }
 
-    const h = computeThresholds(hotspot_scores.items);
-    const c = computeThresholds(complexity_vals.items);
-    const r = computeThresholds(revisions_vals.items);
-    const a = computeThresholds(authors_vals.items);
-    const cong = computeThresholds(congestion_vals.items);
-    const risk = computeThresholds(risk_vals.items);
+    const h = try computeThresholds(a, hotspot_scores.items);
+    const c = try computeThresholds(a, complexity_vals.items);
+    const r = try computeThresholds(a, revisions_vals.items);
+    const aa = try computeThresholds(a, authors_vals.items);
+    const cong = try computeThresholds(a, congestion_vals.items);
+    const risk = try computeThresholds(a, risk_vals.items);
 
     return .{
-        .p60_hotspot = h[0], .p85_hotspot = h[1], .p95_hotspot = h[2],
-        .p60_complexity = c[0], .p85_complexity = c[1], .p95_complexity = c[2],
-        .p60_revisions = r[0], .p85_revisions = r[1], .p95_revisions = r[2],
-        .p60_authors = a[0], .p85_authors = a[1], .p95_authors = a[2],
-        .p60_congestion = cong[0], .p85_congestion = cong[1], .p95_congestion = cong[2],
-        .p60_risk = risk[0], .p85_risk = risk[1], .p95_risk = risk[2],
+        .thresholds = .{
+            .p60_hotspot = h[0], .p85_hotspot = h[1], .p95_hotspot = h[2],
+            .p60_complexity = c[0], .p85_complexity = c[1], .p95_complexity = c[2],
+            .p60_revisions = r[0], .p85_revisions = r[1], .p95_revisions = r[2],
+            .p60_authors = aa[0], .p85_authors = aa[1], .p95_authors = aa[2],
+            .p60_congestion = cong[0], .p85_congestion = cong[1], .p95_congestion = cong[2],
+            .p60_risk = risk[0], .p85_risk = risk[1], .p95_risk = risk[2],
+        },
+        .method = .percentile,
+        .mature_file_count = mature_files,
     };
 }
 
@@ -159,4 +190,61 @@ test "fallback thresholds sanity" {
     const t = fallbackThresholds();
     try std.testing.expect(t.p60_hotspot < t.p85_hotspot);
     try std.testing.expect(t.p85_hotspot < t.p95_hotspot);
+}
+
+test "calibrateThresholds fallback when not enough mature files" {
+    const a = std.testing.allocator;
+
+    // Only 1 file with >=5 revisions (need 5 files with >=5 revs by default)
+    var files: [3]types.FileResult = undefined;
+    files[0] = types.FileResult{
+        .metrics = .{ .path = "a.zig", .loc = 100, .indent_mean = 2.0, .indent_max = 4, .indent_std = 1.0, .comment_ratio = 0.1 },
+        .evolution = .{ .revisions = 10, .authors = 2, .churn = 100, .entity_effort = 0.1, .main_dev_pct = 0.5 },
+        .signals = .{ .hotspot_score = 20.0, .knowledge_loss_risk = 1.0, .developer_congestion = 0.2, .complexity_trend = 0.0 },
+        .hotspot_zone = .green, .complexity_zone = .green, .revisions_zone = .green, .authors_zone = .green, .congestion_zone = .green, .risk_zone = .green,
+    };
+    files[1] = types.FileResult{
+        .metrics = .{ .path = "b.zig", .loc = 50, .indent_mean = 1.5, .indent_max = 3, .indent_std = 0.5, .comment_ratio = 0.2 },
+        .evolution = .{ .revisions = 1, .authors = 1, .churn = 10, .entity_effort = 0.01, .main_dev_pct = 1.0 },
+        .signals = .{ .hotspot_score = 1.5, .knowledge_loss_risk = 0.0, .developer_congestion = 1.0, .complexity_trend = 0.0 },
+        .hotspot_zone = .green, .complexity_zone = .green, .revisions_zone = .green, .authors_zone = .green, .congestion_zone = .green, .risk_zone = .green,
+    };
+    files[2] = types.FileResult{
+        .metrics = .{ .path = "c.zig", .loc = 200, .indent_mean = 4.0, .indent_max = 12, .indent_std = 2.0, .comment_ratio = 0.05 },
+        .evolution = .{ .revisions = 2, .authors = 2, .churn = 50, .entity_effort = 0.05, .main_dev_pct = 0.7 },
+        .signals = .{ .hotspot_score = 8.0, .knowledge_loss_risk = 1.2, .developer_congestion = 1.0, .complexity_trend = 0.0 },
+        .hotspot_zone = .green, .complexity_zone = .green, .revisions_zone = .green, .authors_zone = .green, .congestion_zone = .green, .risk_zone = .green,
+    };
+
+    const cal = try calibrateThresholds(a, &files, 5, 5);
+    try std.testing.expectEqual(@as(Calibration.CalibrationMethod, .fallback), cal.method);
+    try std.testing.expectEqual(@as(u32, 1), cal.mature_file_count);
+    try std.testing.expectEqual(@as(f64, 10), cal.thresholds.p60_hotspot);
+    try std.testing.expectEqual(@as(f64, 30), cal.thresholds.p85_hotspot);
+    try std.testing.expectEqual(@as(f64, 50), cal.thresholds.p95_hotspot);
+}
+
+test "calibrateThresholds percentile when enough mature files" {
+    const a = std.testing.allocator;
+
+    // 6 files, all with >=5 revisions — passes default gate (5 files, 5 revisions)
+    var files: [6]types.FileResult = undefined;
+    for (&files, 0..) |*f, i| {
+        f.* = types.FileResult{
+            .metrics = .{ .path = "f.zig", .loc = 100, .indent_mean = @floatFromInt(i + 1), .indent_max = 4, .indent_std = 1.0, .comment_ratio = 0.1 },
+            .evolution = .{ .revisions = 5 + @as(u32, @intCast(i)), .authors = 1, .churn = 10, .entity_effort = 0.01, .main_dev_pct = 1.0 },
+            .signals = .{ .hotspot_score = @floatFromInt(10 * (i + 1)), .knowledge_loss_risk = 0.0, .developer_congestion = 0.1, .complexity_trend = 0.0 },
+            .hotspot_zone = .green, .complexity_zone = .green, .revisions_zone = .green, .authors_zone = .green, .congestion_zone = .green, .risk_zone = .green,
+        };
+    }
+
+    const cal = try calibrateThresholds(a, &files, 5, 5);
+    try std.testing.expectEqual(@as(Calibration.CalibrationMethod, .percentile), cal.method);
+    try std.testing.expectEqual(@as(u32, 6), cal.mature_file_count);
+    // With 6 files, hotspot scores 10,20,30,40,50,60:
+    // p60 index = floor(0.60 * 5) = 3 → 40.0
+    // p85 index = floor(0.85 * 5) = 4 → 50.0
+    // p95 index = floor(0.95 * 5) = 4 → 50.0
+    try std.testing.expectEqual(@as(f64, 40.0), cal.thresholds.p60_hotspot);
+    try std.testing.expectEqual(@as(f64, 50.0), cal.thresholds.p85_hotspot);
 }

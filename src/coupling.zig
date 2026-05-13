@@ -2,6 +2,51 @@ const std = @import("std");
 const types = @import("types.zig");
 const git_log = @import("git_log.zig");
 
+// ── Packed pair-key helpers ──
+
+/// Pack two file indices into a single u64 key (always sorted so a < b).
+inline fn packPairKey(a: usize, b: usize) u64 {
+    const min = @min(a, b);
+    const max = @max(a, b);
+    return (@as(u64, @intCast(min)) << 32) | @as(u64, @intCast(max));
+}
+
+inline fn unpackPairKey(key: u64) struct { min: usize, max: usize } {
+    const min = @as(usize, @intCast(key >> 32));
+    const max = @as(usize, @intCast(key & 0xFFFFFFFF));
+    return .{ .min = min, .max = max };
+}
+
+/// Determine trend direction from split-window shared-commit counts.
+fn coupleTrend(
+    half: usize,
+    total_commits: usize,
+    first_shared: u32,
+    second_shared: u32,
+) types.TrendDirection {
+    if (half == 0 or total_commits - half == 0) return .stable;
+
+    const first_degree = @as(f64, @floatFromInt(first_shared)) / @as(f64, @floatFromInt(half));
+    const second_degree = @as(f64, @floatFromInt(second_shared)) / @as(f64, @floatFromInt(total_commits - half));
+    const ratio = if (first_degree > 0) second_degree / first_degree else if (second_degree > 0) @as(f64, 2.0) else @as(f64, 1.0);
+
+    if (ratio > 1.3) return .rising;
+    if (ratio < 0.7) return .falling;
+    return .stable;
+}
+
+/// Returns coupling degree if the pair passes minimum thresholds, else null.
+fn computeDegree(shared: u32, total_a: u32, total_b: u32) ?f64 {
+    if (shared < 3) return null;
+    if (total_a == 0 or total_b == 0) return null;
+
+    const degree_ab = @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(total_a));
+    const degree_ba = @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(total_b));
+    const degree = @max(degree_ab, degree_ba);
+
+    return if (degree >= 0.15) degree else null;
+}
+
 /// Build a sparse co-change (coupling) matrix from git log commit→files data.
 ///
 /// Algorithm (§8.2 of design):
@@ -46,65 +91,8 @@ pub fn computeCoupling(
     var total_commits_map = std.HashMap(usize, u32, std.hash_map.AutoContext(usize), 80).init(a);
     defer total_commits_map.deinit();
 
-    // First pass: count total_commits per file (across commits, not per pair)
-    // and shared_commits per pair.
-    // We also need the halfway split for trend analysis.
+    // Single pass: index files, count totals/shared, and split per half for trend.
     const half = commit_files_list.len / 2;
-
-    for (commit_files_list, 0..) |cf, commit_idx| {
-        if (cf.files.len < 2) continue;
-
-        // Index each file in this commit
-        var file_idxs = std.ArrayList(usize).empty;
-        defer file_idxs.deinit(a);
-
-        for (cf.files) |file_path| {
-            const gop = try path_to_idx.getOrPut(file_path);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = path_table.items.len;
-                try path_table.append(a, file_path);
-            }
-            try file_idxs.append(a, gop.value_ptr.*);
-        }
-
-        // Increment total_commits for each file in this commit
-        for (file_idxs.items) |fidx| {
-            const t_gop = try total_commits_map.getOrPut(fidx);
-            if (t_gop.found_existing) {
-                t_gop.value_ptr.* += 1;
-            } else {
-                t_gop.value_ptr.* = 1;
-            }
-        }
-
-        // Increment shared_commits for all pairs in this commit
-        for (file_idxs.items, 0..) |fidx_a, i| {
-            for (file_idxs.items[i + 1 ..]) |fidx_b| {
-                const min = @min(fidx_a, fidx_b);
-                const max = @max(fidx_a, fidx_b);
-                const key = (@as(u64, @intCast(min)) << 32) | @as(u64, @intCast(max));
-
-                const s_gop = try shared_map.getOrPut(key);
-                if (s_gop.found_existing) {
-                    s_gop.value_ptr.* += 1;
-                } else {
-                    s_gop.value_ptr.* = 1;
-
-                    // Also store the commit index range start (for trend)
-                    // We need two-pass: store first_half / second_half
-                }
-            }
-        }
-
-        _ = commit_idx;
-    }
-
-    if (verbose) {
-        std.debug.print("  coupling: {d} files, {d} candidate pairs\n", .{ path_table.items.len, shared_map.count() });
-    }
-
-    // We need per-pair half counts for trend analysis.
-    // Simpler approach: re-do the counting splitting into two halves.
     var first_half = std.HashMap(u64, u32, std.hash_map.AutoContext(u64), 80).init(a);
     defer first_half.deinit();
     var second_half = std.HashMap(u64, u32, std.hash_map.AutoContext(u64), 80).init(a);
@@ -117,75 +105,60 @@ pub fn computeCoupling(
         defer file_idxs.deinit(a);
 
         for (cf.files) |file_path| {
-            if (path_to_idx.get(file_path)) |fidx| {
-                try file_idxs.append(a, fidx);
+            const gop = try path_to_idx.getOrPut(file_path);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = path_table.items.len;
+                try path_table.append(a, file_path);
             }
+            try file_idxs.append(a, gop.value_ptr.*);
+        }
+
+        for (file_idxs.items) |fidx| {
+            const t_gop = try total_commits_map.getOrPut(fidx);
+            t_gop.value_ptr.* = if (t_gop.found_existing) t_gop.value_ptr.* + 1 else 1;
         }
 
         const target_map = if (commit_idx < half) &first_half else &second_half;
 
         for (file_idxs.items, 0..) |fidx_a, i| {
             for (file_idxs.items[i + 1 ..]) |fidx_b| {
-                const min = @min(fidx_a, fidx_b);
-                const max = @max(fidx_a, fidx_b);
-                const key = (@as(u64, @intCast(min)) << 32) | @as(u64, @intCast(max));
+                const key = packPairKey(fidx_a, fidx_b);
 
-                const gop = try target_map.getOrPut(key);
-                if (gop.found_existing) {
-                    gop.value_ptr.* += 1;
-                } else {
-                    gop.value_ptr.* = 1;
-                }
+                const s_gop = try shared_map.getOrPut(key);
+                s_gop.value_ptr.* = if (s_gop.found_existing) s_gop.value_ptr.* + 1 else 1;
+
+                const h_gop = try target_map.getOrPut(key);
+                h_gop.value_ptr.* = if (h_gop.found_existing) h_gop.value_ptr.* + 1 else 1;
             }
         }
     }
 
-    // Build output: iterate shared_map, compute degree, filter by thresholds
+    if (verbose) {
+        std.debug.print("  coupling: {d} files, {d} candidate pairs\n", .{ path_table.items.len, shared_map.count() });
+    }
+
+    // Build output
     var pair_count: usize = 0;
     var iter = shared_map.iterator();
     while (iter.next()) |entry| {
         const key = entry.key_ptr.*;
         const shared = entry.value_ptr.*;
-        const min = @as(usize, @intCast(key >> 32));
-        const max = @as(usize, @intCast(key & 0xFFFFFFFF));
+        const unpacked = unpackPairKey(key);
 
-        if (shared < 3) continue;
+        const total_a = total_commits_map.get(unpacked.min) orelse 0;
+        const total_b = total_commits_map.get(unpacked.max) orelse 0;
 
-        const total_a = total_commits_map.get(min) orelse 0;
-        const total_b = total_commits_map.get(max) orelse 0;
-        if (total_a == 0 or total_b == 0) continue;
-
-        const degree_ab = @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(total_a));
-        const degree_ba = @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(total_b));
-        const degree = @max(degree_ab, degree_ba);
-
-        if (degree < 0.15) continue;
-
-        // Trend: compare first_half degree vs second_half degree
-        const first_shared = first_half.get(key) orelse 0;
-        const second_shared = second_half.get(key) orelse 0;
-
-        // Total per half may differ; compute degree per half
-        // For simplicity, use rough comparison of shared count normalized
-        var trend: types.TrendDirection = .stable;
-        if (half > 0 and (commit_files_list.len - half) > 0) {
-            const first_degree = @as(f64, @floatFromInt(first_shared)) / @as(f64, @floatFromInt(half));
-            const second_degree = @as(f64, @floatFromInt(second_shared)) / @as(f64, @floatFromInt(commit_files_list.len - half));
-            const ratio = if (first_degree > 0) second_degree / first_degree else if (second_degree > 0) @as(f64, 2.0) else @as(f64, 1.0);
-
-            if (ratio > 1.3) {
-                trend = .rising;
-            } else if (ratio < 0.7) {
-                trend = .falling;
-            }
-        }
-
-        const file_a = path_table.items[min];
-        const file_b = path_table.items[max];
+        const degree = computeDegree(shared, total_a, total_b) orelse continue;
+        const trend = coupleTrend(
+            half,
+            commit_files_list.len,
+            first_half.get(key) orelse 0,
+            second_half.get(key) orelse 0,
+        );
 
         try results.append(a, .{
-            .file_a = file_a,
-            .file_b = file_b,
+            .file_a = path_table.items[unpacked.min],
+            .file_b = path_table.items[unpacked.max],
             .shared_commits = shared,
             .total_commits_a = total_a,
             .total_commits_b = total_b,
@@ -255,4 +228,23 @@ test "computeCoupling basic pair" {
     try std.testing.expectEqual(@as(usize, 1), results.items.len);
     try std.testing.expectEqual(@as(f64, 1.0), results.items[0].degree);
     try std.testing.expect(results.items[0].shared_commits >= 3);
+}
+
+test "packPairKey unpackPairKey roundtrip" {
+    const pairs = [_]struct { a: usize, b: usize }{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 5, .b = 3 },
+        .{ .a = 100, .b = 200 },
+        .{ .a = 0xFFFFFFFF, .b = 0 },
+    };
+
+    for (pairs) |p| {
+        const key = packPairKey(p.a, p.b);
+        const unpacked = unpackPairKey(key);
+        // pack sorts, so min/max may swap
+        const expected_min = @min(p.a, p.b);
+        const expected_max = @max(p.a, p.b);
+        try std.testing.expectEqual(expected_min, unpacked.min);
+        try std.testing.expectEqual(expected_max, unpacked.max);
+    }
 }

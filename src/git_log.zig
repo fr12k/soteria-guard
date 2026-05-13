@@ -67,6 +67,55 @@ pub const CommitFiles = struct {
     files: []const []const u8,
 };
 
+/// Shared helper: spawn git with the given argv, capture stdout/stderr, check exit code.
+fn runGitAndCapture(
+    a: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    verbose: bool,
+) !struct { stdout: []u8, stderr: []u8 } {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+
+    var stdout_output = std.ArrayList(u8).empty;
+    errdefer stdout_output.deinit(a);
+    if (child.stdout) |child_stdout| {
+        var read_buf: [8192]u8 = undefined;
+        var reader = child_stdout.reader(io, &read_buf);
+        try reader.interface.appendRemaining(a, &stdout_output, std.Io.Limit.limited(1024 * 1024 * 10));
+    }
+
+    var stderr_output = std.ArrayList(u8).empty;
+    errdefer stderr_output.deinit(a);
+    if (child.stderr) |child_stderr| {
+        var read_buf: [4096]u8 = undefined;
+        var reader = child_stderr.reader(io, &read_buf);
+        reader.interface.appendRemaining(a, &stderr_output, std.Io.Limit.limited(4096)) catch {};
+    }
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) {
+                if (verbose) {
+                    std.debug.print("  git exited with code {d}\n", .{code});
+                    std.debug.print("  stderr: {s}\n", .{stderr_output.items});
+                }
+                return error.GitLogFailed;
+            }
+        },
+        else => return error.GitLogFailed,
+    }
+
+    return .{
+        .stdout = try stdout_output.toOwnedSlice(a),
+        .stderr = try stderr_output.toOwnedSlice(a),
+    };
+}
+
 /// Run `git log --name-only` to extract per-commit file sets for coupling.
 /// This is a separate pass from `runGitLog` because coupling needs commit→set
 /// structure rather than file→time-series structure.
@@ -96,43 +145,11 @@ pub fn runGitLogNameOnly(
         "--no-renames",
     };
 
-    var child = try std.process.spawn(io, .{
-        .argv = argv,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
+    const output = try runGitAndCapture(a, io, argv, verbose);
+    defer a.free(output.stdout);
+    defer a.free(output.stderr);
 
-    var stdout_output = std.ArrayList(u8).empty;
-    defer stdout_output.deinit(a);
-    if (child.stdout) |child_stdout| {
-        var read_buf: [8192]u8 = undefined;
-        var reader = child_stdout.reader(io, &read_buf);
-        try reader.interface.appendRemaining(a, &stdout_output, std.Io.Limit.limited(1024 * 1024 * 10));
-    }
-
-    var stderr_output = std.ArrayList(u8).empty;
-    defer stderr_output.deinit(a);
-    if (child.stderr) |child_stderr| {
-        var read_buf: [4096]u8 = undefined;
-        var reader = child_stderr.reader(io, &read_buf);
-        reader.interface.appendRemaining(a, &stderr_output, std.Io.Limit.limited(4096)) catch {};
-    }
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                if (verbose) {
-                    std.debug.print("  git log --name-only exited with code {d}\n", .{code});
-                    std.debug.print("  stderr: {s}\n", .{stderr_output.items});
-                }
-                return error.GitLogFailed;
-            }
-        },
-        else => return error.GitLogFailed,
-    }
-
-    return parseGitNameOnlyOutput(a, stdout_output.items, verbose);
+    return parseGitNameOnlyOutput(a, output.stdout, verbose);
 }
 
 /// Parse git log --name-only output into a list of CommitFiles.
@@ -221,47 +238,61 @@ pub fn runGitLog(
         "--no-renames",
     };
 
-    // Use the new spawn API
-    var child = try std.process.spawn(io, .{
-        .argv = argv,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
+    const output = try runGitAndCapture(a, io, argv, verbose);
+    defer a.free(output.stdout);
+    defer a.free(output.stderr);
 
-    // Read stdout using the reader interface
-    var stdout_output = std.ArrayList(u8).empty;
-    defer stdout_output.deinit(a);
-    if (child.stdout) |child_stdout| {
-        var read_buf: [8192]u8 = undefined;
-        var reader = child_stdout.reader(io, &read_buf);
-        try reader.interface.appendRemaining(a, &stdout_output, std.Io.Limit.limited(1024 * 1024 * 10));
+    return parseGitLogOutput(a, output.stdout, verbose);
+}
+
+/// Record one numstat hit for `fe` against `commit` in the results list.
+fn recordNumstatHit(
+    results: *std.ArrayList(PerFileTimeSeries),
+    path_to_idx: *std.StringHashMap(usize),
+    fe: FileEntry,
+    commit: ParsedCommit,
+    a: std.mem.Allocator,
+) !void {
+    const gop = try path_to_idx.getOrPut(fe.path);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = results.items.len;
+        try results.append(a, newFileSeries(a, fe.path));
     }
 
-    // Read stderr
-    var stderr_output = std.ArrayList(u8).empty;
-    defer stderr_output.deinit(a);
-    if (child.stderr) |child_stderr| {
-        var read_buf: [4096]u8 = undefined;
-        var reader = child_stderr.reader(io, &read_buf);
-        reader.interface.appendRemaining(a, &stderr_output, std.Io.Limit.limited(4096)) catch {};
-    }
+    const idx = gop.value_ptr.*;
+    const pf = &results.items[idx];
+    pf.churn += fe.added + fe.deleted;
 
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| {
-            if (code != 0) {
-                if (verbose) {
-                    std.debug.print("  git log exited with code {d}\n", .{code});
-                    std.debug.print("  stderr: {s}\n", .{stderr_output.items});
-                }
-                return error.GitLogFailed;
-            }
-        },
-        else => return error.GitLogFailed,
-    }
+    // Deduplicate: only count a file once per commit
+    const is_new_revision = if (pf.last_commit_hash) |last|
+        !std.mem.eql(u8, last, commit.hash)
+    else
+        true;
 
-    // Parse the output
-    return parseGitLogOutput(a, stdout_output.items, verbose);
+    if (!is_new_revision) return;
+
+    pf.revisions += 1;
+    pf.last_commit_hash = commit.hash;
+    try pf.timestamps.append(a, try a.dupe(u8, commit.date));
+    try pf.complexity_series.append(a, 0.0);
+
+    const author_gop = try pf.author_counts.getOrPut(commit.author);
+    author_gop.value_ptr.* = if (author_gop.found_existing)
+        author_gop.value_ptr.* + 1
+    else
+        1;
+}
+
+fn newFileSeries(a: std.mem.Allocator, path: []const u8) PerFileTimeSeries {
+    return .{
+        .path = path,
+        .revisions = 0,
+        .author_counts = std.StringHashMap(u32).init(a),
+        .churn = 0,
+        .complexity_series = std.ArrayList(f64).empty,
+        .timestamps = std.ArrayList([]const u8).empty,
+        .last_commit_hash = null,
+    };
 }
 
 /// Parse the full git log output into per-file time series.
@@ -270,7 +301,6 @@ fn parseGitLogOutput(
     output: []const u8,
     verbose: bool,
 ) !std.ArrayList(PerFileTimeSeries) {
-    // Map from path → index in the results array
     var path_to_idx = std.StringHashMap(usize).init(a);
     defer path_to_idx.deinit();
 
@@ -287,81 +317,26 @@ fn parseGitLogOutput(
 
     while (lines.next()) |line| {
         if (std.mem.eql(u8, line, "COMMIT")) {
-            // End previous commit's numstat block
             in_numstat = false;
             current_commit = null;
             continue;
         }
 
         if (current_commit == null) {
-            // This is the hash
             if (line.len == 40) {
-                const hash = try a.dupe(u8, line);
-                const date_line = lines.next() orelse continue;
-                const date = try a.dupe(u8, date_line);
-                const author = try a.dupe(u8, lines.next() orelse continue);
-                const email = try a.dupe(u8, lines.next() orelse continue);
-                current_commit = ParsedCommit{ .hash = hash, .date = date, .author = author, .email = email };
-                in_numstat = true;
+                current_commit = try parseCommitHeader(a, line, &lines);
             }
+            in_numstat = current_commit != null;
             continue;
         }
 
-        if (!in_numstat) continue;
+        if (!in_numstat or line.len == 0) continue;
 
-        // Skip empty lines separating commits
-        if (line.len == 0) continue;
-
-        // Try parsing as numstat line
         const entry = parseNumstatLine(line, a) catch continue;
-        const fe = entry orelse continue; // binary/rename skipped
-
+        const fe = entry orelse continue;
         total_entries += 1;
 
-        // Find or create per-file entry
-        const gop = try path_to_idx.getOrPut(fe.path);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = results.items.len;
-            try results.append(a, .{
-                .path = fe.path,
-                .revisions = 0,
-                .author_counts = std.StringHashMap(u32).init(a),
-                .churn = 0,
-                .complexity_series = std.ArrayList(f64).empty,
-                .timestamps = std.ArrayList([]const u8).empty,
-                .last_commit_hash = null,
-            });
-        }
-
-        const idx = gop.value_ptr.*;
-        const pf = &results.items[idx];
-        pf.churn += fe.added + fe.deleted;
-
-        // Deduplicate within the same commit: if we already saw this file
-        // in the current commit, don't increment revision/author again.
-        const is_new_revision = if (pf.last_commit_hash) |last| blk: {
-            break :blk !std.mem.eql(u8, last, current_commit.?.hash);
-        } else true;
-
-        if (is_new_revision) {
-            pf.revisions += 1;
-            const date_owned = try a.dupe(u8, current_commit.?.date);
-            try pf.timestamps.append(a, date_owned);
-            // complexity_series gets filled in later by complexity scanning
-            try pf.complexity_series.append(a, 0.0);
-
-            // Track author for this commit
-            const author = current_commit.?.author;
-            const author_gop = try pf.author_counts.getOrPut(author);
-            if (author_gop.found_existing) {
-                author_gop.value_ptr.* += 1;
-            } else {
-                author_gop.value_ptr.* = 1;
-            }
-
-            // Update last hash for next iteration
-            pf.last_commit_hash = current_commit.?.hash;
-        }
+        try recordNumstatHit(&results, &path_to_idx, fe, current_commit.?, a);
     }
 
     if (verbose) {
@@ -369,6 +344,19 @@ fn parseGitLogOutput(
     }
 
     return results;
+}
+
+/// Parse the 4-line commit header that follows a "COMMIT" marker.
+fn parseCommitHeader(a: std.mem.Allocator, hash: []const u8, lines: anytype) !?ParsedCommit {
+    const date_line = lines.next() orelse return null;
+    const author = lines.next() orelse return null;
+    const email = lines.next() orelse return null;
+    return ParsedCommit{
+        .hash = try a.dupe(u8, hash),
+        .date = try a.dupe(u8, date_line),
+        .author = try a.dupe(u8, author),
+        .email = try a.dupe(u8, email),
+    };
 }
 
 test "parseNumstatLine basic" {
